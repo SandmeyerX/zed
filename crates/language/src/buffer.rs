@@ -106,6 +106,8 @@ pub struct Buffer {
     branch_state: Option<BufferBranchState>,
     /// Filesystem state, `None` when there is no path.
     file: Option<Arc<dyn File>>,
+    recovered_file: Option<(PathBuf, Option<MTime>)>,
+    restoration_state: RestorationState,
     /// The mtime of the file when this buffer was last loaded from
     /// or saved to disk.
     saved_mtime: Option<MTime>,
@@ -188,6 +190,13 @@ pub enum ParseStatus {
 struct BufferBranchState {
     base_buffer: Entity<Buffer>,
     merged_operations: Vec<Lamport>,
+}
+
+#[derive(PartialEq, Eq)]
+enum RestorationState {
+    NotRestored,
+    Restored,
+    Unsaved,
 }
 
 /// An immutable, cheaply cloneable representation of a fixed
@@ -1170,6 +1179,8 @@ impl Buffer {
             text: buffer,
             branch_state: None,
             file,
+            recovered_file: None,
+            restoration_state: RestorationState::NotRestored,
             capability,
             syntax_map,
             reparse: None,
@@ -1524,6 +1535,29 @@ impl Buffer {
         self.file.as_ref()
     }
 
+    pub fn recovered_file(&self) -> Option<&(PathBuf, Option<MTime>)> {
+        self.recovered_file.as_ref()
+    }
+
+    pub fn set_recovered_file(
+        &mut self,
+        path: PathBuf,
+        mtime: Option<MTime>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file.is_some() {
+            return;
+        }
+        let was_dirty = self.is_dirty();
+        self.recovered_file = Some((path, mtime));
+        self.was_changed();
+        if was_dirty != self.is_dirty() {
+            cx.emit(BufferEvent::DirtyChanged);
+        }
+        cx.emit(BufferEvent::FileHandleChanged);
+        cx.notify();
+    }
+
     /// The version of the buffer that was last saved or reloaded from disk.
     pub fn saved_version(&self) -> &clock::Global {
         &self.saved_version
@@ -1660,6 +1694,9 @@ impl Buffer {
         self.has_unsaved_edits.set((version, false));
         self.has_conflict = false;
         self.saved_mtime = mtime;
+        if self.restoration_state == RestorationState::Unsaved {
+            self.restoration_state = RestorationState::Restored;
+        }
         self.was_changed();
         cx.emit(BufferEvent::Saved);
         cx.notify();
@@ -1786,8 +1823,57 @@ impl Buffer {
             .set((self.saved_version.clone(), false));
         self.text.set_line_ending(line_ending);
         self.saved_mtime = mtime;
+        if self.restoration_state == RestorationState::Unsaved {
+            let was_dirty = self.is_dirty();
+            self.restoration_state = RestorationState::Restored;
+            self.was_changed();
+            if was_dirty != self.is_dirty() {
+                cx.emit(BufferEvent::DirtyChanged);
+            }
+        }
         cx.emit(BufferEvent::Reloaded);
         cx.notify();
+    }
+
+    /// Restores serialized buffer contents by overwriting the buffer with saved text.
+    /// This is somewhat wasteful since we load the whole buffer from disk then overwrite it,
+    /// but keeps implementation simple as we don't need to persist all metadata from loading
+    /// (git diff base, etc.).
+    pub fn restore_serialized_contents(
+        &mut self,
+        contents: String,
+        mtime: Option<MTime>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.restoration_state != RestorationState::NotRestored {
+            return;
+        }
+        self.restoration_state = RestorationState::Restored;
+        if self.has_unsaved_edits() {
+            return;
+        }
+        // If we did restore an mtime, store it on the buffer so that
+        // the next edit will mark the buffer as dirty/conflicted.
+        if mtime.is_some() {
+            self.did_reload(self.version(), self.line_ending(), mtime, cx);
+        }
+        self.set_text(contents, cx);
+        if let Some(entry) = self.peek_undo_stack() {
+            self.forget_transaction(entry.transaction_id());
+        }
+        if self
+            .file
+            .as_ref()
+            .is_some_and(|file| !file.disk_state().exists())
+        {
+            let was_dirty = self.is_dirty();
+            self.restoration_state = RestorationState::Unsaved;
+            self.was_changed();
+            if was_dirty != self.is_dirty() {
+                cx.emit(BufferEvent::DirtyChanged);
+            }
+            cx.notify();
+        }
     }
 
     /// Updates the [`File`] backing this buffer. This should be called when
@@ -1814,6 +1900,7 @@ impl Buffer {
         };
 
         self.file = Some(new_file);
+        self.recovered_file = None;
         if file_changed {
             self.refresh_resolved_settings(cx);
             self.was_changed();
@@ -2534,7 +2621,10 @@ impl Buffer {
         if self.capability == Capability::ReadOnly {
             return false;
         }
-        if self.has_conflict {
+        if self.has_conflict
+            || self.recovered_file.is_some()
+            || self.restoration_state == RestorationState::Unsaved
+        {
             return true;
         }
         match self.file.as_ref().map(|f| f.disk_state()) {
