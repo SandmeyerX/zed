@@ -761,7 +761,7 @@ impl VimGlobals {
             let Some(action) = event.action.as_ref().map(|action| action.boxed_clone()) else {
                 return;
             };
-            Vim::globals(cx).observe_action(action.boxed_clone())
+            Self::observe_action_after_input(action, cx)
         })
         .detach();
 
@@ -963,6 +963,29 @@ impl VimGlobals {
                 (Some(_), None) => true,
                 (None, _) => false,
             }
+        })
+    }
+
+    pub(crate) fn observe_action_after_input(action: Box<dyn Action>, cx: &mut App) {
+        let deferred_action = action.boxed_clone();
+        if Self::defer_input(
+            move |_, cx| Vim::globals(cx).observe_action(deferred_action),
+            cx,
+        ) {
+            return;
+        }
+        Vim::globals(cx).observe_action(action);
+    }
+
+    pub(crate) fn defer_input(
+        continuation: impl FnOnce(&mut Window, &mut App) + 'static,
+        cx: &mut App,
+    ) -> bool {
+        let editor = Vim::globals(cx)
+            .focused_vim()
+            .and_then(|vim| vim.read(cx).editor());
+        editor.is_some_and(|editor| {
+            editor.update(cx, |editor, _| editor.defer_external_input(continuation))
         })
     }
 

@@ -393,7 +393,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 }
 
 impl Vim {
-    pub fn normal_motion(
+    pub(crate) fn plan_normal_motion(
         &mut self,
         motion: Motion,
         operator: Option<Operator>,
@@ -401,14 +401,21 @@ impl Vim {
         forced_motion: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        match operator {
-            None => self.move_cursor(motion, times, window, cx),
-            Some(Operator::Change) => self.change_motion(motion, times, forced_motion, window, cx),
-            Some(Operator::Delete) => self.delete_motion(motion, times, forced_motion, window, cx),
-            Some(Operator::Yank) => self.yank_motion(motion, times, forced_motion, window, cx),
-            Some(Operator::AddSurrounds { target: None }) => {}
-            Some(Operator::Indent) => self.indent_motion(
+    ) -> Result<crate::GeometryCommit, editor::display_map::PendingRowGeometry> {
+        let commit = match operator {
+            None => self.plan_move_cursor(motion, times, window, cx),
+            Some(Operator::Change) => {
+                self.plan_change_motion(motion, times, forced_motion, window, cx)
+            }
+            Some(Operator::Delete) => {
+                self.plan_delete_motion(motion, times, forced_motion, window, cx)
+            }
+            Some(Operator::Yank) => self.plan_yank_motion(motion, times, forced_motion, window, cx),
+            Some(Operator::AddSurrounds { target: None }) => Ok(Box::new(
+                |_: &mut Vim, _: &mut Window, _: &mut Context<Vim>| {},
+            )
+                as crate::GeometryCommit),
+            Some(Operator::Indent) => self.plan_indent_motion(
                 motion,
                 times,
                 forced_motion,
@@ -416,8 +423,10 @@ impl Vim {
                 window,
                 cx,
             ),
-            Some(Operator::Rewrap) => self.rewrap_motion(motion, times, forced_motion, window, cx),
-            Some(Operator::Outdent) => self.indent_motion(
+            Some(Operator::Rewrap) => {
+                self.plan_rewrap_motion(motion, times, forced_motion, window, cx)
+            }
+            Some(Operator::Outdent) => self.plan_indent_motion(
                 motion,
                 times,
                 forced_motion,
@@ -425,7 +434,7 @@ impl Vim {
                 window,
                 cx,
             ),
-            Some(Operator::AutoIndent) => self.indent_motion(
+            Some(Operator::AutoIndent) => self.plan_indent_motion(
                 motion,
                 times,
                 forced_motion,
@@ -434,9 +443,9 @@ impl Vim {
                 cx,
             ),
             Some(Operator::ShellCommand) => {
-                self.shell_command_motion(motion, times, forced_motion, window, cx)
+                self.plan_shell_command_motion(motion, times, forced_motion, window, cx)
             }
-            Some(Operator::Lowercase) => self.convert_motion(
+            Some(Operator::Lowercase) => self.plan_convert_motion(
                 motion,
                 times,
                 forced_motion,
@@ -444,7 +453,7 @@ impl Vim {
                 window,
                 cx,
             ),
-            Some(Operator::Uppercase) => self.convert_motion(
+            Some(Operator::Uppercase) => self.plan_convert_motion(
                 motion,
                 times,
                 forced_motion,
@@ -452,7 +461,7 @@ impl Vim {
                 window,
                 cx,
             ),
-            Some(Operator::OppositeCase) => self.convert_motion(
+            Some(Operator::OppositeCase) => self.plan_convert_motion(
                 motion,
                 times,
                 forced_motion,
@@ -460,7 +469,7 @@ impl Vim {
                 window,
                 cx,
             ),
-            Some(Operator::Rot13) => self.convert_motion(
+            Some(Operator::Rot13) => self.plan_convert_motion(
                 motion,
                 times,
                 forced_motion,
@@ -468,7 +477,7 @@ impl Vim {
                 window,
                 cx,
             ),
-            Some(Operator::Rot47) => self.convert_motion(
+            Some(Operator::Rot47) => self.plan_convert_motion(
                 motion,
                 times,
                 forced_motion,
@@ -477,24 +486,30 @@ impl Vim {
                 cx,
             ),
             Some(Operator::ToggleComments) => {
-                self.toggle_comments_motion(motion, times, forced_motion, window, cx)
+                self.plan_toggle_comments_motion(motion, times, forced_motion, window, cx)
             }
             Some(Operator::ToggleBlockComments) => {
-                self.toggle_block_comments_motion(motion, times, forced_motion, window, cx)
+                self.plan_toggle_block_comments_motion(motion, times, forced_motion, window, cx)
             }
             Some(Operator::ReplaceWithRegister) => {
-                self.replace_with_register_motion(motion, times, forced_motion, window, cx)
+                self.plan_replace_with_register_motion(motion, times, forced_motion, window, cx)
             }
             Some(Operator::Exchange) => {
-                self.exchange_motion(motion, times, forced_motion, window, cx)
+                self.plan_exchange_motion(motion, times, forced_motion, window, cx)
             }
             Some(operator) => {
                 // Can't do anything for text objects, Ignoring
-                error!("Unexpected normal mode motion operator: {:?}", operator)
+                Ok(
+                    Box::new(move |_: &mut Vim, _: &mut Window, _: &mut Context<Vim>| {
+                        error!("Unexpected normal mode motion operator: {operator:?}");
+                    }) as crate::GeometryCommit,
+                )
             }
-        }
-        // Exit temporary normal mode (if active).
-        self.exit_temporary_normal(window, cx);
+        }?;
+        Ok(Box::new(move |vim, window, cx| {
+            commit(vim, window, cx);
+            vim.exit_temporary_normal(window, cx);
+        }))
     }
 
     pub fn normal_object(
@@ -603,38 +618,55 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.update_editor(cx, |vim, editor, cx| {
-            let text_layout_details = editor.text_layout_details(window, cx);
+        self.with_geometry(
+            move |vim, window, cx| vim.plan_move_cursor(motion.clone(), times, window, cx),
+            window,
+            cx,
+        );
+    }
 
-            // If vim is in temporary mode and the motion being used is
-            // `EndOfLine` ($), we'll want to disable clipping at line ends so
-            // that the newline character can be selected so that, when moving
-            // back to visual mode, the cursor will be placed after the last
-            // character and not before it.
-            let clip_at_line_ends = editor.clip_at_line_ends(cx);
-            let should_disable_clip = matches!(motion, Motion::EndOfLine { .. }) && vim.temp_mode;
-
-            if should_disable_clip {
-                editor.set_clip_at_line_ends(false, cx)
-            };
-
-            editor.change_selections(
-                SelectionEffects::default().nav_history(motion.push_to_jump_list()),
-                window,
-                cx,
-                |s| {
-                    s.move_cursors_with(&mut |map, cursor, goal| {
-                        motion
-                            .move_point(map, cursor, goal, times, &text_layout_details)
-                            .unwrap_or((cursor, goal))
-                    })
-                },
-            );
-
-            if should_disable_clip {
-                editor.set_clip_at_line_ends(clip_at_line_ends, cx);
-            };
-        });
+    pub(crate) fn plan_move_cursor(
+        &mut self,
+        motion: Motion,
+        times: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<crate::GeometryCommit, editor::display_map::PendingRowGeometry> {
+        // If vim is in temporary mode and the motion being used is
+        // `EndOfLine` ($), we'll want to disable clipping at line ends so
+        // that the newline character can be selected so that, when moving
+        // back to visual mode, the cursor will be placed after the last
+        // character and not before it.
+        let should_disable_clip = matches!(motion, Motion::EndOfLine { .. }) && self.temp_mode;
+        let selections = self.plan_selections(
+            should_disable_clip.then_some(false),
+            window,
+            cx,
+            |map, details, mut selection| {
+                let (cursor, goal) = motion
+                    .move_point(map, selection.head(), selection.goal, times, details)?
+                    .unwrap_or((selection.head(), selection.goal));
+                selection.collapse_to(cursor, goal);
+                Ok(selection.map(|point| point.to_point(map)))
+            },
+        )?;
+        Ok(Box::new(move |vim, window, cx| {
+            vim.update_editor(cx, |_, editor, cx| {
+                let clip_at_line_ends = editor.clip_at_line_ends(cx);
+                if should_disable_clip {
+                    editor.set_clip_at_line_ends(false, cx);
+                }
+                editor.change_selections(
+                    SelectionEffects::default().nav_history(motion.push_to_jump_list()),
+                    window,
+                    cx,
+                    |selections_collection| selections_collection.select(selections),
+                );
+                if should_disable_clip {
+                    editor.set_clip_at_line_ends(clip_at_line_ends, cx);
+                }
+            });
+        }))
     }
 
     fn insert_after(&mut self, _: &InsertAfter, window: &mut Window, cx: &mut Context<Self>) {
@@ -1176,16 +1208,248 @@ impl Vim {
 
 #[cfg(test)]
 mod test {
-    use gpui::{KeyBinding, TestAppContext, UpdateGlobal};
+    use gpui::{
+        AppContext as _, Context, Focusable as _, KeyBinding, Keystroke, TestAppContext,
+        UpdateGlobal, Window,
+    };
     use indoc::indoc;
     use settings::SettingsStore;
 
     use crate::{
-        motion,
+        Vim, VimAddon, motion,
         state::Mode::{self},
         test::{NeovimBackedTestContext, VimTestContext},
     };
-    use language;
+    use editor::{Editor, MultiBuffer, MultiBufferOffset, SelectionEffects};
+    use language::{self, Point, language_settings::SoftWrap};
+
+    #[gpui::test]
+    async fn test_pending_motion_replans_all_cursors_before_queued_keys(cx: &mut TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(SoftWrap::None, cx));
+        cx.run_until_parked();
+        let vim =
+            cx.update_editor(|editor, _, _| editor.addon::<VimAddon>().unwrap().entity.clone());
+        let completion = cx.update(|window, cx| {
+            vim.update(cx, |vim, cx| {
+                vim.update_editor(cx, |_, editor, cx| {
+                    editor.set_text(format!("ab\ncd\nef\n{}\ngh", "z".repeat(2_000)), window, cx);
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([
+                                Point::new(0, 1)..Point::new(0, 1),
+                                Point::new(2, 1)..Point::new(2, 1),
+                            ]);
+                        },
+                    );
+                });
+                vim.motion(
+                    motion::Motion::Down {
+                        display_lines: false,
+                    },
+                    window,
+                    cx,
+                );
+                vim.update_editor(cx, |_, editor, cx| {
+                    assert_eq!(
+                        editor
+                            .selections
+                            .all::<Point>(&editor.display_snapshot(cx))
+                            .into_iter()
+                            .map(|selection| selection.head())
+                            .collect::<Vec<_>>(),
+                        [Point::new(0, 1), Point::new(2, 1)]
+                    );
+                });
+                vim.motion(motion::Motion::Right, window, cx);
+            });
+            window.dispatch_keystroke(Keystroke::parse("i").unwrap(), cx);
+            window.dispatch_keystroke(Keystroke::parse("x").unwrap(), cx);
+            vim.update(cx, |vim, cx| {
+                vim.update_editor(cx, |_, editor, cx| {
+                    assert_eq!(
+                        editor.text(cx),
+                        format!("ab\ncd\nef\n{}\ngh", "z".repeat(2_000))
+                    );
+                    editor.buffer().update(cx, |buffer, cx| {
+                        buffer.edit(
+                            [(MultiBufferOffset(0)..MultiBufferOffset(0), "q\n")],
+                            None,
+                            cx,
+                        );
+                    });
+                    editor.input_completion(cx)
+                })
+                .unwrap()
+            })
+        });
+        completion.await.expect("queued Vim input completed");
+        cx.assert_state(
+            &format!("q\nab\ncxˇd\nef\nzzxˇ{}\ngh", "z".repeat(1_998)),
+            Mode::Insert,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_pending_keys_keep_originating_editor_after_focus_change(cx: &mut TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        let origin = cx.editor.clone();
+        let (workspace, other) = cx.workspace(|workspace, window, cx| {
+            let buffer = MultiBuffer::build_simple("KEEP", cx);
+            let other = cx.new(|cx| {
+                Editor::for_multibuffer(buffer, Some(workspace.project().clone()), window, cx)
+            });
+            workspace.add_item_to_active_pane(Box::new(other.clone()), None, true, window, cx);
+            (cx.entity(), other)
+        });
+
+        for insert in [false, true] {
+            cx.workspace(|workspace, window, cx| {
+                assert!(workspace.activate_item(&origin, true, true, window, cx));
+            });
+            cx.set_state("aˇb\nshort\ntail", Mode::Normal);
+            cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(SoftWrap::None, cx));
+            cx.run_until_parked();
+            cx.background_executor.set_block_on_ticks(0..=0);
+            let suffix = "z".repeat(1_998);
+            let text = format!("ab\nXY{suffix}\ntail");
+            let completion = cx.update(|window, cx| {
+                origin.update(cx, |editor, cx| {
+                    editor.set_text(text.clone(), window, cx);
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            let cursor = Point::new(0, 1);
+                            selections.select_ranges([cursor..cursor]);
+                        },
+                    );
+                });
+                window.dispatch_keystroke(Keystroke::parse("j").unwrap(), cx);
+                origin.update(cx, |editor, cx| {
+                    assert_eq!(
+                        editor
+                            .selections
+                            .newest::<Point>(&editor.display_snapshot(cx))
+                            .head(),
+                        Point::new(0, 1),
+                    );
+                });
+                if insert {
+                    window.dispatch_keystroke(Keystroke::parse("i").unwrap(), cx);
+                }
+                window.dispatch_keystroke(Keystroke::parse("x").unwrap(), cx);
+                let completion = origin.update(cx, |editor, cx| {
+                    assert_eq!(editor.text(cx), text);
+                    editor.input_completion(cx)
+                });
+                workspace.update(cx, |workspace, cx| {
+                    assert!(workspace.activate_item(&other, true, true, window, cx));
+                });
+                completion
+            });
+            completion
+                .await
+                .expect("originating editor input completed");
+            cx.background_executor.set_block_on_ticks(0..=50);
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                origin.update(cx, |editor, cx| {
+                    let (expected, column, mode) = if insert {
+                        (format!("ab\nXxY{suffix}\ntail"), 2, Mode::Insert)
+                    } else {
+                        (format!("ab\nX{suffix}\ntail"), 1, Mode::Normal)
+                    };
+                    assert_eq!(editor.text(cx), expected);
+                    assert_eq!(
+                        editor
+                            .selections
+                            .newest::<Point>(&editor.display_snapshot(cx))
+                            .head(),
+                        Point::new(1, column),
+                    );
+                    assert_eq!(
+                        editor.addon::<VimAddon>().unwrap().entity.read(cx).mode,
+                        mode
+                    );
+                });
+                other.update(cx, |editor, cx| {
+                    assert_eq!(editor.text(cx), "KEEP");
+                    assert_eq!(
+                        editor
+                            .selections
+                            .newest::<Point>(&editor.display_snapshot(cx))
+                            .head(),
+                        Point::new(0, 0),
+                    );
+                    assert_eq!(
+                        editor.addon::<VimAddon>().unwrap().entity.read(cx).mode,
+                        Mode::Normal
+                    );
+                    assert!(editor.focus_handle(cx).is_focused(window));
+                });
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_pending_direct_delete_plans_all_selections_before_editing(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(SoftWrap::None, cx));
+        cx.run_until_parked();
+        let vim =
+            cx.update_editor(|editor, _, _| editor.addon::<VimAddon>().unwrap().entity.clone());
+        let completion = cx.update(|window, cx| {
+            vim.update(cx, |vim, cx| {
+                let original = format!("ab\ncd\nef\n{}\ntail", "z".repeat(2_000));
+                vim.update_editor(cx, |_, editor, cx| {
+                    editor.set_text(original.clone(), window, cx);
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            selections.select_ranges([
+                                Point::new(0, 1)..Point::new(0, 1),
+                                Point::new(2, 1)..Point::new(2, 1),
+                            ]);
+                        },
+                    );
+                });
+                vim.delete_motion(
+                    motion::Motion::Down {
+                        display_lines: false,
+                    },
+                    None,
+                    false,
+                    window,
+                    cx,
+                );
+                vim.update_editor(cx, |_, editor, cx| {
+                    assert_eq!(editor.text(cx), original);
+                    assert_eq!(
+                        editor
+                            .selections
+                            .all::<Point>(&editor.display_snapshot(cx))
+                            .into_iter()
+                            .map(|selection| selection.head())
+                            .collect::<Vec<_>>(),
+                        [Point::new(0, 1), Point::new(2, 1)]
+                    );
+                    editor.input_completion(cx)
+                })
+                .unwrap()
+            })
+        });
+        completion.await.expect("deferred Vim deletion completed");
+        cx.update_editor(|editor, _, cx| assert_eq!(editor.text(cx), "tail"));
+    }
 
     #[gpui::test]
     async fn test_h(cx: &mut gpui::TestAppContext) {
@@ -1239,6 +1503,139 @@ mod test {
         )
         .await
         .assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_repeated_vertical_motion_preserves_merged_cursors(cx: &mut TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update_editor(|editor, _, cx| editor.set_soft_wrap_mode(SoftWrap::None, cx));
+        let line = "x".repeat(133_005);
+        let source = format!("{}😀{}", "x".repeat(100_000), "x".repeat(33_001));
+
+        for display_lines in [false, true] {
+            for (mode, reversed, interrupt, settle_first) in [
+                (Mode::Normal, false, false, true),
+                (Mode::Normal, false, false, false),
+                (Mode::Normal, false, true, false),
+                (Mode::Visual, false, false, false),
+                (Mode::Visual, true, false, false),
+                (Mode::HelixSelect, false, false, false),
+                (Mode::HelixSelect, true, false, false),
+            ] {
+                let (text, source_row, motion) = if reversed {
+                    (
+                        format!("ˇ{line}\nxx\n"),
+                        2,
+                        motion::Motion::Up { display_lines },
+                    )
+                } else {
+                    (
+                        format!("ˇ\nxx\n{line}"),
+                        0,
+                        motion::Motion::Down { display_lines },
+                    )
+                };
+                cx.set_state(&text, mode);
+                cx.background_executor.set_block_on_ticks(0..=0);
+                let (vim, oldest_id) = cx.update_editor(|editor, window, cx| {
+                    editor.buffer().update(cx, |buffer, cx| {
+                        let start = Point::new(source_row, 0);
+                        buffer.edit([(start..start, source.as_str())], None, cx);
+                    });
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| {
+                            let columns = if mode == Mode::Normal {
+                                &[133_003, 133_004][..]
+                            } else {
+                                &[133_003][..]
+                            };
+                            selections.select_ranges(columns.iter().map(|&column| {
+                                let point = Point::new(source_row, column);
+                                let end = Point::new(source_row, column + 1);
+                                if mode == Mode::Normal {
+                                    point..point
+                                } else if reversed {
+                                    end..point
+                                } else {
+                                    point..end
+                                }
+                            }));
+                        },
+                    );
+                    (
+                        editor.addon::<VimAddon>().cloned().unwrap(),
+                        editor.selections.oldest_anchor().id,
+                    )
+                });
+                if settle_first {
+                    cx.background_executor.set_block_on_ticks(0..=50);
+                    cx.run_until_parked();
+                    cx.background_executor.set_block_on_ticks(0..=0);
+                }
+                cx.update(|window, cx| {
+                    vim.entity.update(cx, |vim, cx| {
+                        vim.motion(motion.clone(), window, cx);
+                        let assert_motion =
+                            move |vim: &mut Vim, _: &mut Window, cx: &mut Context<Vim>| {
+                                vim.update_editor(cx, |_, editor, cx| {
+                                    assert_eq!(editor.selections.count(), 1);
+                                    let snapshot = editor.display_snapshot(cx);
+                                    let selection = editor.selections.newest::<Point>(&snapshot);
+                                    let head = if mode == Mode::Normal {
+                                        Point::new(1, 1)
+                                    } else if reversed {
+                                        Point::new(1, 2)
+                                    } else {
+                                        Point::new(2, 0)
+                                    };
+                                    assert_eq!(
+                                        (selection.head(), selection.reversed),
+                                        (head, reversed)
+                                    );
+                                    assert_eq!(selection.id, oldest_id);
+                                });
+                            };
+                        if !vim.defer_input(assert_motion, cx) {
+                            assert_motion(vim, window, cx);
+                        }
+                        if interrupt {
+                            vim.motion(motion::Motion::Left, window, cx);
+                        }
+                        vim.motion(motion, window, cx);
+                    });
+                });
+                let completion = cx.update_editor(|editor, _, cx| editor.input_completion(cx));
+                cx.background_executor.set_block_on_ticks(0..=50);
+                completion.await.expect("deferred motions");
+                cx.run_until_parked();
+                cx.update_editor(|editor, _, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    let expected = if interrupt {
+                        vec![(Point::new(2, 0)..Point::new(2, 0), false)]
+                    } else if mode == Mode::Normal {
+                        vec![(Point::new(2, 133_001)..Point::new(2, 133_001), false)]
+                    } else if reversed {
+                        vec![(Point::new(0, 133_001)..Point::new(2, 133_004), true)]
+                    } else {
+                        vec![(Point::new(0, 133_003)..Point::new(2, 133_002), false)]
+                    };
+                    assert_eq!(
+                        editor
+                            .selections
+                            .all::<Point>(&snapshot)
+                            .into_iter()
+                            .map(|selection| (selection.range(), selection.reversed))
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "mode={mode:?}, reversed={reversed}, display_lines={display_lines}, interrupt={interrupt}, settle_first={settle_first}"
+                    );
+                    assert_eq!(editor.selections.oldest_anchor().id, oldest_id);
+                });
+            }
+        }
     }
 
     #[gpui::test]
