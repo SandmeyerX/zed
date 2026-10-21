@@ -1,9 +1,10 @@
+use super::MODEL_DISCOVERY_TIMEOUT;
 use anyhow::Result;
 use collections::{HashMap, HashSet};
 use credentials_provider::CredentialsProvider;
 use fs::Fs;
-use futures::{FutureExt, StreamExt, future::BoxFuture};
-use gpui::{App, AsyncApp, Context, Entity, Task, TaskExt};
+use futures::{FutureExt, StreamExt, channel::oneshot, future::BoxFuture};
+use gpui::{App, AsyncApp, Context, Entity, FutureExt as _, Task, TaskExt};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, InlineDescription, LanguageModel,
@@ -88,10 +89,11 @@ impl State {
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        self.fetch_model_task = None;
         let credentials_provider = self.credentials_provider.clone();
         let api_url = LlamaCppLanguageModelProvider::api_url(cx);
         let task = self.api_key_state.store(
-            api_url,
+            api_url.clone(),
             api_key,
             |this| &mut this.api_key_state,
             credentials_provider,
@@ -103,37 +105,28 @@ impl State {
         // below restarts it).
         self.model_event_task = None;
         write_recover(&self.loading_progress).clear();
-        cx.spawn(async move |this, cx| {
+        cx.spawn(async move |state, cx| {
             let result = task.await;
-            this.update(cx, |this, cx| this.restart_fetch_models_task(cx))
+            state
+                .update(cx, |state, cx| {
+                    if LlamaCppLanguageModelProvider::api_url(cx) == api_url {
+                        state.fetch_model_task = None;
+                        state.restart_fetch_models_task(false, cx);
+                    }
+                })
                 .ok();
             result
         })
     }
 
-    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
-        let credentials_provider = self.credentials_provider.clone();
-        let api_url = LlamaCppLanguageModelProvider::api_url(cx);
-        let load_key_task = self.api_key_state.load_if_needed(
-            api_url,
-            |this| &mut this.api_key_state,
-            credentials_provider,
-            cx,
-        );
-
-        if self.is_authenticated() {
-            return Task::ready(Ok(()));
-        }
-
-        cx.spawn(async move |this, cx| {
-            match load_key_task.await {
-                Ok(()) | Err(AuthenticateError::CredentialsNotFound) => {}
-                Err(error) => {
-                    log::warn!("failed to load llama.cpp API key: {error}");
-                }
-            }
-            let fetch_models_task = this.update(cx, |this, cx| this.fetch_models(cx))?;
-            match fetch_models_task.await {
+    fn authenticate(
+        &mut self,
+        retry_credentials: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), AuthenticateError>> {
+        self.fetch_model_task = None;
+        let authenticate = async move |state: gpui::WeakEntity<Self>, cx: &mut AsyncApp| {
+            match Self::fetch_models(state, retry_credentials, cx).await {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     // A refused connection means the server isn't running yet, not an error.
@@ -151,105 +144,152 @@ impl State {
                     }
                 }
             }
-        })
+        };
+        let (mut sender, receiver) = oneshot::channel();
+        self.fetch_model_task = Some(cx.spawn(async move |state, cx| {
+            let result = futures::select_biased! {
+                _ = sender.cancellation().fuse() => return Ok(()),
+                result = authenticate(state, cx).fuse() => result,
+            };
+            sender.send(result).ok();
+            Ok(())
+        }));
+        cx.background_spawn(async move { receiver.await.unwrap_or(Ok(())) })
     }
 
-    fn fetch_models(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let http_client = Arc::clone(&self.http_client);
-        let settings = LlamaCppLanguageModelProvider::settings(cx);
-        let api_url = LlamaCppLanguageModelProvider::api_url(cx);
-        let api_key = self.api_key_state.key(&api_url);
-        let extra_headers = settings.custom_headers.clone();
+    async fn fetch_models(
+        state: gpui::WeakEntity<Self>,
+        retry_credentials: bool,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let load_key_task = state.update(cx, |state, cx| {
+            let credentials_provider = state.credentials_provider.clone();
+            let api_url = LlamaCppLanguageModelProvider::api_url(cx);
+            if retry_credentials {
+                state.api_key_state.load_if_needed(
+                    api_url,
+                    |state| &mut state.api_key_state,
+                    credentials_provider,
+                    cx,
+                )
+            } else {
+                state.api_key_state.load_cached(
+                    api_url,
+                    |state| &mut state.api_key_state,
+                    credentials_provider,
+                    cx,
+                )
+            }
+        })?;
+        match load_key_task.await {
+            Ok(()) | Err(AuthenticateError::CredentialsNotFound) => {}
+            Err(error) => {
+                log::warn!("failed to load llama.cpp API key: {error}");
+            }
+        }
 
-        cx.spawn(async move |this, cx| {
-            let entries = get_models(
+        let (http_client, api_url, api_key, extra_headers) = state.read_with(cx, |state, cx| {
+            let api_url = LlamaCppLanguageModelProvider::api_url(cx);
+            let api_key = state.api_key_state.key(&api_url);
+            let extra_headers = LlamaCppLanguageModelProvider::settings(cx)
+                .custom_headers
+                .clone();
+            (state.http_client.clone(), api_url, api_key, extra_headers)
+        })?;
+        let executor = cx.background_executor().clone();
+        let entries = get_models(
+            http_client.as_ref(),
+            &api_url,
+            api_key.as_deref(),
+            &extra_headers,
+        )
+        .with_timeout(MODEL_DISCOVERY_TIMEOUT, &executor)
+        .await??;
+
+        let is_router = entries.iter().any(ModelEntry::is_router_entry);
+
+        // Models the server reports as loading, used below to prune stale
+        // progress labels by reconciling against the live listing (a preempted
+        // load or missed SSE event can skip the terminal event).
+        let loading_ids: HashSet<String> = entries
+            .iter()
+            .filter(|entry| entry.is_loading())
+            .map(|entry| entry.id.clone())
+            .collect();
+
+        let models: Vec<llama_cpp::Model> = if is_router {
+            // Router mode: metadata comes from `/v1/models`. We probe
+            // `/props` only for loaded models so listing never triggers a
+            // load; unloaded models use the listing's hints and overrides.
+            let tasks = entries.into_iter().map(|entry| {
+                let http_client = Arc::clone(&http_client);
+                let api_url = api_url.clone();
+                let api_key = api_key.clone();
+                let extra_headers = extra_headers.clone();
+                let executor = executor.clone();
+                async move {
+                    let props = if entry.is_loaded() {
+                        get_props(
+                            http_client.as_ref(),
+                            &api_url,
+                            api_key.as_deref(),
+                            Some(&entry.id),
+                            &extra_headers,
+                        )
+                        .with_timeout(MODEL_DISCOVERY_TIMEOUT, &executor)
+                        .await
+                        .unwrap_or_else(|error| Err(anyhow::Error::from(error)))
+                        .log_err()
+                    } else {
+                        None
+                    };
+                    model_from_entry(&entry, props.as_ref())
+                }
+            });
+            futures::stream::iter(tasks)
+                .buffer_unordered(5)
+                .collect()
+                .await
+        } else {
+            // Single-model mode: one `/props` call describes the loaded model.
+            let props = get_props(
                 http_client.as_ref(),
                 &api_url,
                 api_key.as_deref(),
+                None,
                 &extra_headers,
             )
-            .await?;
-
-            let is_router = entries.iter().any(ModelEntry::is_router_entry);
-
-            // Models the server reports as loading, used below to prune stale
-            // progress labels by reconciling against the live listing (a preempted
-            // load or missed SSE event can skip the terminal event).
-            let loading_ids: HashSet<String> = entries
+            .with_timeout(MODEL_DISCOVERY_TIMEOUT, &executor)
+            .await
+            .unwrap_or_else(|error| Err(anyhow::Error::from(error)))
+            .log_err();
+            entries
                 .iter()
-                .filter(|entry| entry.is_loading())
-                .map(|entry| entry.id.clone())
-                .collect();
+                .map(|entry| model_from_entry(entry, props.as_ref()))
+                .collect()
+        };
 
-            let models: Vec<llama_cpp::Model> = if is_router {
-                // Router mode: metadata comes from `/v1/models`. We probe
-                // `/props` only for loaded models so listing never triggers a
-                // load; unloaded models use the listing's hints and overrides.
-                let tasks = entries.into_iter().map(|entry| {
-                    let http_client = Arc::clone(&http_client);
-                    let api_url = api_url.clone();
-                    let api_key = api_key.clone();
-                    let extra_headers = extra_headers.clone();
-                    async move {
-                        let props = if entry.is_loaded() {
-                            get_props(
-                                http_client.as_ref(),
-                                &api_url,
-                                api_key.as_deref(),
-                                Some(&entry.id),
-                                &extra_headers,
-                            )
-                            .await
-                            .log_err()
-                        } else {
-                            None
-                        };
-                        model_from_entry(&entry, props.as_ref())
-                    }
-                });
-                futures::stream::iter(tasks)
-                    .buffer_unordered(5)
-                    .collect()
-                    .await
-            } else {
-                // Single-model mode: one `/props` call describes the loaded model.
-                let props = get_props(
-                    http_client.as_ref(),
-                    &api_url,
-                    api_key.as_deref(),
-                    None,
-                    &extra_headers,
-                )
-                .await
-                .log_err();
-                entries
-                    .iter()
-                    .map(|entry| model_from_entry(entry, props.as_ref()))
-                    .collect()
-            };
-
-            this.update(cx, |this, cx| {
-                this.fetched_models = models;
-                let effective = compute_effective_models(
-                    &this.fetched_models,
-                    LlamaCppLanguageModelProvider::settings(cx),
-                );
-                sync_capability_cells(&this.capability_cells, &effective);
-                // Drop progress labels for models no longer loading, so a stale
-                // "Loading …" can't stick after a preempted load or missed event.
-                write_recover(&this.loading_progress).retain(|id, _| loading_ids.contains(id));
-                // Router mode loads models on demand: subscribe so capabilities
-                // self-correct as they load/unload. Start it once (events trigger
-                // re-discovery, not a re-spawn); single-model mode needs no stream.
-                if is_router {
-                    if this.model_event_task.is_none() {
-                        this.start_model_event_stream(cx);
-                    }
-                } else {
-                    this.model_event_task = None;
+        state.update(cx, |this, cx| {
+            this.fetched_models = models;
+            let effective = compute_effective_models(
+                &this.fetched_models,
+                LlamaCppLanguageModelProvider::settings(cx),
+            );
+            sync_capability_cells(&this.capability_cells, &effective);
+            // Drop progress labels for models no longer loading, so a stale
+            // "Loading …" can't stick after a preempted load or missed event.
+            write_recover(&this.loading_progress).retain(|id, _| loading_ids.contains(id));
+            // Router mode loads models on demand: subscribe so capabilities
+            // self-correct as they load/unload. Start it once (events trigger
+            // re-discovery, not a re-spawn); single-model mode needs no stream.
+            if is_router {
+                if this.model_event_task.is_none() {
+                    this.start_model_event_stream(cx);
                 }
-                cx.notify();
-            })
+            } else {
+                this.model_event_task = None;
+            }
+            cx.notify();
         })
     }
 
@@ -309,7 +349,8 @@ impl State {
                             if this
                                 .update(cx, |this, cx| {
                                     write_recover(&this.loading_progress).remove(&event.model);
-                                    this.restart_fetch_models_task(cx);
+                                    this.fetch_model_task = None;
+                                    this.restart_fetch_models_task(false, cx);
                                 })
                                 .is_err()
                             {
@@ -333,9 +374,19 @@ impl State {
         }));
     }
 
-    fn restart_fetch_models_task(&mut self, cx: &mut Context<Self>) {
-        let task = self.fetch_models(cx);
-        self.fetch_model_task.replace(task);
+    fn restart_fetch_models_task(&mut self, retry_credentials: bool, cx: &mut Context<Self>) {
+        if !retry_credentials
+            && self
+                .fetch_model_task
+                .as_ref()
+                .is_some_and(|task| !task.is_ready())
+        {
+            return;
+        }
+        self.fetch_model_task =
+            Some(cx.spawn(async move |state, cx| {
+                Self::fetch_models(state, retry_credentials, cx).await
+            }));
     }
 }
 
@@ -486,7 +537,8 @@ impl LlamaCppLanguageModelProvider {
                                 // the new URL (re-auth below restarts it).
                                 this.model_event_task = None;
                                 write_recover(&this.loading_progress).clear();
-                                this.authenticate(cx).detach();
+                                this.fetch_model_task = None;
+                                this.restart_fetch_models_task(false, cx);
                             }
                             cx.notify();
                         }
@@ -508,7 +560,7 @@ impl LlamaCppLanguageModelProvider {
         };
         // Discover eagerly so a running server is picked up without opening settings.
         this.state
-            .update(cx, |state, cx| state.restart_fetch_models_task(cx));
+            .update(cx, |state, cx| state.restart_fetch_models_task(false, cx));
         this
     }
 
@@ -677,7 +729,22 @@ impl LanguageModelProvider for LlamaCppLanguageModelProvider {
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        self.state.update(cx, |state, cx| state.authenticate(cx))
+        self.state
+            .update(cx, |state, cx| state.authenticate(true, cx))
+    }
+
+    fn refresh_models(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
+        self.state.update(cx, |state, cx| {
+            if state
+                .fetch_model_task
+                .as_ref()
+                .is_some_and(|task| !task.is_ready())
+            {
+                Task::ready(Ok(()))
+            } else {
+                state.authenticate(false, cx)
+            }
+        })
     }
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
@@ -1046,7 +1113,7 @@ impl ConfigurationView {
         }
 
         self.state.update(cx, |state, cx| {
-            state.restart_fetch_models_task(cx);
+            state.restart_fetch_models_task(true, cx);
         });
     }
 
@@ -1871,6 +1938,36 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_registry_discovery_recovery(cx: &mut TestAppContext) {
+        crate::provider::ollama::tests::assert_registry_discovery_recovery(
+            test_provider,
+            |provider, key, cx| {
+                provider
+                    .state
+                    .update(cx, |state, cx| state.set_api_key(key, cx))
+            },
+            DISCOVERY_RESPONSES,
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
+    async fn test_connect_during_discovery(cx: &mut TestAppContext) {
+        crate::provider::ollama::tests::assert_connect_during_discovery(
+            test_provider,
+            |provider, cx| {
+                provider
+                    .state
+                    .update(cx, |state, cx| state.restart_fetch_models_task(true, cx))
+            },
+            DISCOVERY_RESPONSES,
+            cx,
+        )
+        .await;
+    }
+
+    #[gpui::test]
     async fn authenticate_fetches_models_after_loading_api_key(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
@@ -1936,7 +2033,36 @@ mod tests {
         );
         assert_eq!(
             &*model_request_authorizations.lock(),
-            &[None, Some("Bearer loaded-key".to_string())]
+            &[
+                Some("Bearer loaded-key".to_string()),
+                Some("Bearer loaded-key".to_string())
+            ]
         );
     }
+
+    fn test_provider(
+        http_client: Arc<dyn HttpClient>,
+        credentials: Arc<dyn CredentialsProvider>,
+        cx: &mut App,
+    ) -> LlamaCppLanguageModelProvider {
+        let provider = LlamaCppLanguageModelProvider::new(http_client, credentials, cx);
+        provider.state.update(cx, |state, cx| {
+            state.api_key_state = ApiKeyState::new(
+                LlamaCppLanguageModelProvider::api_url(cx),
+                EnvVar {
+                    name: SharedString::new_static("TEST_API_KEY"),
+                    value: None,
+                },
+            );
+        });
+        provider
+    }
+
+    const DISCOVERY_RESPONSES: &[(&str, &str)] = &[
+        (
+            "/v1/models",
+            r#"{"data":[{"id":"test-model","meta":{"n_ctx":4096}}]}"#,
+        ),
+        ("/props", "{}"),
+    ];
 }
